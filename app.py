@@ -2,8 +2,6 @@ import datetime
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from openai import OpenAI
-
 
 # ==========================================
 # The Stock Screener Agent Logic
