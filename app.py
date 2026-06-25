@@ -2,6 +2,7 @@ import datetime
 import pandas as pd
 import streamlit as st
 import yfinance as yf
+from openai import OpenAI
 
 
 # ==========================================
@@ -34,10 +35,7 @@ class StockScreenerAgent:
             start_date = end_date - datetime.timedelta(days=365)
 
             stock = yf.Ticker(ticker)
-            # FIX: Removed progress=False parameter which caused the Streamlit error
-            df = stock.history(
-                start=start_date, end=end_date, interval="1d"
-            )
+            df = stock.history(start=start_date, end=end_date, interval="1d")
 
             if len(df) < 200:
                 return {
@@ -99,16 +97,16 @@ class StockScreenerAgent:
 # Streamlit Web Interface Design
 # ==========================================
 st.set_page_config(
-    page_title="Golden Cross & RSI Screener Agent",
+    page_title="Grounded Golden Cross & RSI Screener Agent",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("📈 Golden Cross & RSI Screener Agent")
+st.title("📈 Grounded Golden Cross & RSI Screener Agent")
 st.markdown(
     """
-This agent scans a list of stock tickers to find candidates that have **recently completed a Golden Cross** 
-(50-day SMA crossing above 200-day SMA) and currently have an **RSI just above 50** (indicating emerging bullish momentum).
+This agent scans a list of stock tickers using **live APIs (No Hallucinations)** to find candidates that have **recently completed a Golden Cross** 
+and currently have an **RSI just above 50**.
 """
 )
 
@@ -129,8 +127,9 @@ lookback = st.sidebar.number_input(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(
-    "💡 *A smaller lookback finds stocks that crossed very recently. A wider lookback gives a broader window.*"
+st.sidebar.header("🤖 LLM Analyst (Optional)")
+openai_api_key = st.sidebar.text_input(
+    "Enter OpenAI API Key to enable AI Grounded Insights:", type="password"
 )
 
 # Main input layout
@@ -208,6 +207,62 @@ if st.button("🚀 Run Screener Agent", type="primary"):
                 "days_since_cross",
             ]
             st.dataframe(df_matches[display_cols], use_container_width=True)
+
+            # ==========================================
+            # GROUNDED LLM GENERATION (RAG Pattern)
+            # ==========================================
+            if openai_api_key:
+                st.markdown("---")
+                st.markdown("### 🤖 Grounded AI Analysis")
+                with st.spinner("Generating grounded AI analysis..."):
+                    try:
+                        # 1. Structure the retrieved API data into text
+                        data_context = ""
+                        for idx, row in df_matches.iterrows():
+                            data_context += (
+                                f"Ticker: {row['ticker']}\n"
+                                f"- Current Price: ${row['current_price']}\n"
+                                f"- SMA50: {row['SMA50']}\n"
+                                f"- SMA200: {row['SMA200']}\n"
+                                f"- RSI: {row['RSI']}\n"
+                                f"- Golden Cross occurred: {row['days_since_cross']} trading days ago\n\n"
+                            )
+
+                        # 2. Strict Grounding System Prompt
+                        system_prompt = (
+                            "You are a professional financial analyst. Your task is to explain the technical setups of "
+                            "the stocks provided. You must adhere to these STRICT GROUNDING RULES:\n"
+                            "1. Use ONLY the data provided to you in the user prompt. Do not look up or estimate prices.\n"
+                            "2. Do NOT hallucinate, extrapolate, or invent any stock prices or metrics.\n"
+                            "3. If you write about a stock, you must cite the exact price, RSI, and SMA values provided.\n"
+                            "4. Explain why a Golden Cross combined with an RSI just above 50 is a bullish indicator (emergence of momentum)."
+                        )
+
+                        user_prompt = (
+                            f"Analyze these stocks that just matched our screener criteria:\n\n"
+                            f"{data_context}"
+                        )
+
+                        # 3. Call OpenAI Client
+                        client = OpenAI(api_key=openai_api_key)
+                        response = client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "system", "content": system_prompt},
+                                {"role": "user", "content": user_prompt},
+                            ],
+                            temperature=0.2,  # Low temperature prevents creativity/hallucinations
+                        )
+
+                        st.markdown(response.choices[0].message.content)
+
+                    except Exception as e:
+                        st.error(f"Could not generate AI analysis: {str(e)}")
+            else:
+                st.info(
+                    "💡 *Tip: Enter an OpenAI API Key in the sidebar to get automated AI technical analysis on these results.*"
+                )
+
         else:
             st.error(
                 "❌ No stocks in the provided list currently meet the criteria."
