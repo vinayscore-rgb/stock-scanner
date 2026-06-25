@@ -34,8 +34,9 @@ class StockScreenerAgent:
             start_date = end_date - datetime.timedelta(days=365)
 
             stock = yf.Ticker(ticker)
+            # FIX: Removed progress=False parameter which caused the Streamlit error
             df = stock.history(
-                start=start_date, end=end_date, interval="1d", progress=False
+                start=start_date, end=end_date, interval="1d"
             )
 
             if len(df) < 200:
