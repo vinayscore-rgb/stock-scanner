@@ -10,7 +10,7 @@ from bs4 import BeautifulSoup
 # Google Finance Scraping Helper
 # ==========================================
 def scrape_google_finance_price(ticker: str) -> tuple:
-    """Scrapes real-time stock price from Google Finance DOM[<vertex-ai-rich-citation-chip>2</vertex-ai-rich-citation-chip>]."""
+    """Scrapes real-time stock price from Google Finance DOM."""
     exchanges = ["NASDAQ", "NYSE", "BATS", "OTCMKTS", "INDEXSP", "INDEXDJX"]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -24,7 +24,7 @@ def scrape_google_finance_price(ticker: str) -> tuple:
             res = requests.get(url, headers=headers, timeout=5)
             if res.status_code == 200:
                 soup = BeautifulSoup(res.text, "html.parser")
-                # Class 'YMlKec fxKbKc' is Google's active market price class[<vertex-ai-rich-citation-chip>2</vertex-ai-rich-citation-chip>]
+                # Class 'YMlKec fxKbKc' is Google's active market price class
                 price_div = soup.find("div", class_="YMlKec fxKbKc")
                 if price_div:
                     price_str = price_div.text.replace("$", "").replace(",", "").strip()
@@ -144,7 +144,6 @@ class StockScreenerAgent:
 
             if is_currently_bullish:
                 # We search up to 30 trading days back to see when the cross actually occurred
-                # (This powers the recommendation engine for "near-matches")
                 for i in range(1, 31):
                     idx = -i
                     if len(df) + idx - 1 < 0:
@@ -280,7 +279,7 @@ st.set_page_config(
 st.title("📈 Golden Cross & RSI Screener Agent")
 st.markdown(
     """
-This agent scans stocks using **real-time prices pulled directly from Google Finance**[<vertex-ai-rich-citation-chip>1</vertex-ai-rich-citation-chip>] to locate setups where a **Golden Cross** 
+This agent scans stocks using **real-time prices pulled directly from Google Finance** to locate setups where a **Golden Cross** 
 recently formed, and the **RSI (14)** is sitting just above the 50 line (representing emerging bullish momentum).
 """
 )
