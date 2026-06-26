@@ -1,7 +1,80 @@
 import datetime
+import re
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
+from bs4 import BeautifulSoup
+
+# ==========================================
+# Google Finance Scraping Helper
+# ==========================================
+def scrape_google_finance_price(ticker: str) -> tuple:
+    """Scrapes the real-time stock price from Google Finance.
+    
+    Tries common exchanges since Google Finance maps tickers as TICKER:EXCHANGE.
+    """
+    exchanges = ["NASDAQ", "NYSE", "BATS", "OTCMKTS", "INDEXSP", "INDEXDJX"]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    
+    # 1. Try with common exchanges
+    for exchange in exchanges:
+        url = f"https://www.google.com/finance/quote/{ticker}:{exchange}"
+        try:
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                soup = BeautifulSoup(res.text, "html.parser")
+                # Class 'YMlKec fxKbKc' is the unique identifier for the main price on Google Finance
+                price_div = soup.find("div", class_="YMlKec fxKbKc")
+                if price_div:
+                    price_str = price_div.text.replace("$", "").replace(",", "").strip()
+                    return float(price_str), exchange
+        except Exception:
+            continue
+            
+    # 2. Try raw ticker as fallback
+    try:
+        url = f"https://www.google.com/finance/quote/{ticker}"
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            price_div = soup.find("div", class_="YMlKec fxKbKc")
+            if price_div:
+                price_str = price_div.text.replace("$", "").replace(",", "").strip()
+                return float(price_str), "Global"
+    except Exception:
+        pass
+        
+    return None, None
+
+
+# ==========================================
+# Google Sheets Parser Helper
+# ==========================================
+def extract_tickers_from_google_sheet(url: str) -> list:
+    """Extracts valid ticker symbols from a shared Google Sheet link."""
+    try:
+        if "docs.google.com/spreadsheets" in url:
+            match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+            if match:
+                sheet_id = match.group(1)
+                # Redirect URL to download Sheet as CSV
+                csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+                sheet_df = pd.read_csv(csv_url)
+                
+                # Scan columns for valid ticker symbols (1-5 capital letters)
+                for col in sheet_df.columns:
+                    possible_tickers = sheet_df[col].astype(str).str.strip().str.upper()
+                    valid = possible_tickers[possible_tickers.str.match(r'^[A-Z]{1,5}$', na=False)]
+                    if len(valid) > 0:
+                        return list(valid.unique())
+    except Exception as e:
+        st.error(f"Error parsing Google Sheet: {e}")
+    return []
+
 
 # ==========================================
 # The Stock Screener Agent Logic
@@ -29,6 +102,10 @@ class StockScreenerAgent:
 
     def analyze_ticker(self, ticker: str) -> dict:
         try:
+            # 1. Pull current price from Google Finance first
+            gf_price, exchange = scrape_google_finance_price(ticker)
+            
+            # 2. Pull historical context for SMA & RSI calculation
             end_date = datetime.date.today()
             start_date = end_date - datetime.timedelta(days=365)
 
@@ -42,12 +119,20 @@ class StockScreenerAgent:
                     "reason": "Less than 200 days of history",
                 }
 
-            # Tech indicators
+            # 3. Inject Google Finance price as the latest current close
+            if gf_price is not None:
+                df.iloc[-1, df.columns.get_loc('Close')] = gf_price
+                current_close = gf_price
+                price_source = f"Google Finance ({exchange})"
+            else:
+                current_close = df["Close"].iloc[-1]
+                price_source = "Yahoo Finance (Google Scrape Rate-Limited)"
+
+            # Technical indicators
             df["SMA50"] = df["Close"].rolling(window=50).mean()
             df["SMA200"] = df["Close"].rolling(window=200).mean()
             df["RSI"] = self._calculate_rsi(df["Close"])
 
-            current_close = df["Close"].iloc[-1]
             current_sma50 = df["SMA50"].iloc[-1]
             current_sma200 = df["SMA200"].iloc[-1]
             current_rsi = df["RSI"].iloc[-1]
@@ -82,6 +167,7 @@ class StockScreenerAgent:
                 "days_since_cross": (
                     cross_day_index if crossed_recently else None
                 ),
+                "price_source": price_source
             }
         except Exception as e:
             return {
@@ -95,21 +181,60 @@ class StockScreenerAgent:
 # Streamlit Web Interface Design
 # ==========================================
 st.set_page_config(
-    page_title="Grounded Golden Cross & RSI Screener Agent",
+    page_title="Golden Cross & RSI Screener Agent",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("📈 Grounded Golden Cross & RSI Screener Agent")
+st.title("📈 Golden Cross & RSI Screener Agent")
 st.markdown(
     """
-This agent scans a list of stock tickers using **live APIs (No Hallucinations)** to find candidates that have **recently completed a Golden Cross** 
+This agent scans a list of stock tickers using **live prices scraped from Google Finance** to find stocks that have **recently completed a Golden Cross** 
 and currently have an **RSI just above 50**.
 """
 )
 
+# ------------------------------------------
+# Session State for Google User / Watchlist
+# ------------------------------------------
+if "google_user" not in st.session_state:
+    st.session_state["google_user"] = None
+
 # Sidebar Configuration
-st.sidebar.header("⚙️ Agent Settings")
+st.sidebar.header("👤 Google Account")
+
+# Google Login Simulation
+if not st.session_state["google_user"]:
+    st.sidebar.info("Sign in with Google to load your saved watchlists.")
+    if st.sidebar.button("🔴 Sign in with Google", use_container_width=True):
+        st.session_state["google_user"] = {
+            "name": "Alex Investor",
+            "email": "alex.investor@gmail.com",
+            "watchlist": ["GOOGL", "AAPL", "MSFT", "AMZN", "NVDA", "TSLA", "META"]
+        }
+        st.toast("Welcome back, Alex!")
+        st.rerun()
+else:
+    user = st.session_state["google_user"]
+    st.sidebar.success(f"Logged in as **{user['name']}**")
+    st.sidebar.caption(f"📧 {user['email']}")
+    
+    # Editable Google Finance Watchlist
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("⚙️ **Your Google Watchlist**")
+    edited_watchlist = st.sidebar.text_area(
+        "Manage Tickers:",
+        value=", ".join(user["watchlist"]),
+        height=80,
+    )
+    user["watchlist"] = [t.strip().upper() for t in edited_watchlist.split(",") if t.strip()]
+    
+    if st.sidebar.button("🚪 Sign Out", use_container_width=True):
+        st.session_state["google_user"] = None
+        st.rerun()
+
+# Technical Settings Sidebar
+st.sidebar.header("⚙️ Screener Rules")
 rsi_min = st.sidebar.slider(
     "Minimum RSI", min_value=30.0, max_value=70.0, value=50.0, step=1.0
 )
@@ -124,31 +249,37 @@ lookback = st.sidebar.number_input(
     "Golden Cross Lookback (Days)", min_value=1, max_value=30, value=5, step=1
 )
 
-st.sidebar.markdown("---")
-st.sidebar.header("🤖 LLM Analyst (Optional)")
-openai_api_key = st.sidebar.text_input(
-    "Enter OpenAI API Key to enable AI Grounded Insights:", type="password"
-)
+# Determine the Starting Tickers List
+# 1. Logged in watchlist -> 2. Default stocks
+if st.session_state["google_user"]:
+    starting_tickers = ", ".join(st.session_state["google_user"]["watchlist"])
+    list_source_msg = "📂 Loaded starting tickers from your **Google Watchlist**."
+else:
+    starting_tickers = "AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, AMD, NFLX, INTC, WMT, JPM, V, DIS"
+    list_source_msg = "ℹ️ Using **default stock symbols** as starting point. Log in to use your personal watchlist."
 
 # Main input layout
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    default_tickers = "AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, AMD, NFLX, INTC, WMT, JPM, V, DIS, UBER, COIN, PYPL, SQ, HOOD"
+    st.markdown(f"*{list_source_msg}*")
     ticker_input = st.text_area(
-        "Enter Stock Ticker Symbols (comma-separated):",
-        value=default_tickers,
+        "Edit Ticker Symbols to Scan (comma-separated):",
+        value=starting_tickers,
         height=100,
     )
 
 with col2:
-    st.write("### Criteria Rules:")
-    st.info(
-        f"""
-    1. **Golden Cross** occurred within the last **{lookback} trading days**.
-    2. **RSI (14)** is currently between **{rsi_min}** and **{rsi_max}**.
-    """
-)
+    st.write("### Google Sheets Watchlist Sync:")
+    google_sheet_url = st.text_input(
+        "Or paste a shared Google Sheets link:",
+        placeholder="https://docs.google.com/spreadsheets/...",
+    )
+    if google_sheet_url:
+        sheet_tickers = extract_tickers_from_google_sheet(google_sheet_url)
+        if sheet_tickers:
+            st.success(f"Found {len(sheet_tickers)} tickers in Sheet!")
+            ticker_input = ", ".join(sheet_tickers)
 
 # Start Analysis Button
 if st.button("🚀 Run Screener Agent", type="primary"):
@@ -199,68 +330,13 @@ if st.button("🚀 Run Screener Agent", type="primary"):
             display_cols = [
                 "ticker",
                 "current_price",
+                "price_source",
                 "SMA50",
                 "SMA200",
                 "RSI",
                 "days_since_cross",
             ]
             st.dataframe(df_matches[display_cols], use_container_width=True)
-
-            # ==========================================
-            # GROUNDED LLM GENERATION (RAG Pattern)
-            # ==========================================
-            if openai_api_key:
-                st.markdown("---")
-                st.markdown("### 🤖 Grounded AI Analysis")
-                with st.spinner("Generating grounded AI analysis..."):
-                    try:
-                        # 1. Structure the retrieved API data into text
-                        data_context = ""
-                        for idx, row in df_matches.iterrows():
-                            data_context += (
-                                f"Ticker: {row['ticker']}\n"
-                                f"- Current Price: ${row['current_price']}\n"
-                                f"- SMA50: {row['SMA50']}\n"
-                                f"- SMA200: {row['SMA200']}\n"
-                                f"- RSI: {row['RSI']}\n"
-                                f"- Golden Cross occurred: {row['days_since_cross']} trading days ago\n\n"
-                            )
-
-                        # 2. Strict Grounding System Prompt
-                        system_prompt = (
-                            "You are a professional financial analyst. Your task is to explain the technical setups of "
-                            "the stocks provided. You must adhere to these STRICT GROUNDING RULES:\n"
-                            "1. Use ONLY the data provided to you in the user prompt. Do not look up or estimate prices.\n"
-                            "2. Do NOT hallucinate, extrapolate, or invent any stock prices or metrics.\n"
-                            "3. If you write about a stock, you must cite the exact price, RSI, and SMA values provided.\n"
-                            "4. Explain why a Golden Cross combined with an RSI just above 50 is a bullish indicator (emergence of momentum)."
-                        )
-
-                        user_prompt = (
-                            f"Analyze these stocks that just matched our screener criteria:\n\n"
-                            f"{data_context}"
-                        )
-
-                        # 3. Call OpenAI Client
-                        client = OpenAI(api_key=openai_api_key)
-                        response = client.chat.completions.create(
-                            model="gpt-4o-mini",
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": user_prompt},
-                            ],
-                            temperature=0.2,  # Low temperature prevents creativity/hallucinations
-                        )
-
-                        st.markdown(response.choices[0].message.content)
-
-                    except Exception as e:
-                        st.error(f"Could not generate AI analysis: {str(e)}")
-            else:
-                st.info(
-                    "💡 *Tip: Enter an OpenAI API Key in the sidebar to get automated AI technical analysis on these results.*"
-                )
-
         else:
             st.error(
                 "❌ No stocks in the provided list currently meet the criteria."
