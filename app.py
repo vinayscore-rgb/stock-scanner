@@ -158,7 +158,8 @@ class StockScreenerAgent:
      
     if valid_divergences:
       # Sort to present the most recent divergence
-      valid_divergences.sort(key=lambda x: x 1 ["idx"], reverse=True)
+      valid_divergences.sort(key=lambda x: x[1]["idx"], reverse=True)
+
       t1, t2 = valid_divergences 0 
       return {
         "has_divergence": True,
