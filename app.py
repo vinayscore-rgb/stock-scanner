@@ -1,573 +1,633 @@
-import datetime
+"""
+Golden Cross & RSI Screener
+===========================
+
+Scans a watchlist for two independent technical setups:
+
+1. **Golden Cross + RSI band** - SMA50 crossed above SMA200 within the last
+   N trading days, while RSI(14) currently sits inside a configurable band.
+2. **Regular Bullish Divergence** - price printed a lower trough while RSI
+   printed a higher trough, resolved within the last 30 trading days.
+
+Price data comes from Yahoo Finance via ``yfinance``, split- and
+dividend-adjusted (``auto_adjust=True``).
+"""
+
+import datetime as dt
+import io
 import re
+from typing import Dict, List, Optional, Sequence, Tuple
+
 import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
-from bs4 import BeautifulSoup
-import concurrent.futures
 
-# ==========================================
-# Google Finance Scraping Helper
-# ==========================================
-def scrape_google_finance_price(ticker: str) -> tuple:
-  """Scrapes real-time stock price from Google Finance DOM."""
-  exchanges = ["NASDAQ", "NYSE", "BATS", "OTCMKTS", "INDEXSP", "INDEXDJX"]
-  headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept-Language": "en-US,en;q=0.9",
-  }
-   
-  # Try with common exchange variations first
-  for exchange in exchanges:
-    url = "https://www.google.com/finance/quote/{}:{}"
-    try:
-      res = requests.get(url, headers=headers, timeout=5)
-      if res.status_code == 200:
-        soup = BeautifulSoup(res.text, "html.parser")
-        # Class 'YMlKec fxKbKc' is Google's active market price class
-        price_div = soup.find("div", class_="YMlKec fxKbKc")
-        if price_div:
-          price_str = price_div.text.replace("$", "").replace(",", "").strip()
-          return float(price_str), exchange
-    except Exception:
-      continue
-       
-  # Try raw ticker as final fallback
-  try:
-    url = "https://www.google.com/finance/quote/{}"
-    res = requests.get(url, headers=headers, timeout=5)
-    if res.status_code == 200:
-      soup = BeautifulSoup(res.text, "html.parser")
-      price_div = soup.find("div", class_="YMlKec fxKbKc")
-      if price_div:
-        price_str = price_div.text.replace("$", "").replace(",", "").strip()
-        return float(price_str), "Global"
-  except Exception:
-    pass
-     
-  return None, None
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
 
-# ==========================================
-# Public Google Sheets Parser Helper
-# ==========================================
-def extract_tickers_from_google_sheet(url: str) -> list:
-  """Extracts valid stock tickers from a public shared Google Sheet."""
-  try:
-    if "docs.google.com/spreadsheets" in url:
-      match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
-      if match:
-        sheet_id = match.group(1)
-        # Appends a direct CSV export endpoint to read the sheet via pandas
-        csv_url = "https://docs.google.com/spreadsheets/d/{}/export?format=csv"
-        sheet_df = pd.read_csv(csv_url)
-         
-        # Look for columns that contain 1 to 5-letter uppercase strings
-        for col in sheet_df.columns:
-          possible_tickers = sheet_df[col].astype(str).str.strip().str.upper()
-          valid = possible_tickers[possible_tickers.str.match(r'^[A-Z]{1,5}$', na=False)]
-          if len(valid) > 0:
-            return list(valid.unique())
-  except Exception as e:
-    st.error(
-      f"Unable to read Sheet: {str(e)}. "
-      "Please make sure your Google Sheet is shared with: 'Anyone with the link can view'."
-    )
-  return []
+HISTORY_YEARS = 2          # 2y keeps SMA200 well-defined across the cross window
+MIN_TRADING_DAYS = 200     # SMA200 needs 200 observations before it exists
+RSI_PERIOD = 14
+SMA_FAST = 50
+SMA_SLOW = 200
+CROSS_SEARCH_DAYS = 30     # how far back we look to date an existing cross
+
+# Divergence detection (fixed - deliberately not exposed in the sidebar)
+DIV_WINDOW = 3             # bars on each side that define a local trough
+DIV_MIN_SEPARATION = 5     # troughs closer than this are the same swing
+DIV_MAX_SEPARATION = 40    # troughs further apart than this aren't related
+DIV_RECENCY = 30           # the second trough must land within this many bars
+DIV_SEARCH_BARS = 90       # only hunt for troughs in this recent slice
+
+CACHE_TTL_SECONDS = 900    # 15 minutes
+MAX_TICKERS = 150          # guard against a paste that would hang the app
+
+NO_DIVERGENCE = {
+    "has_divergence": False,
+    "div_t1_date": "N/A",
+    "div_t1_price": None,
+    "div_t1_rsi": None,
+    "div_t2_date": "N/A",
+    "div_t2_price": None,
+    "div_t2_rsi": None,
+    "div_message": "No bullish divergence",
+}
 
 
-# ==========================================
-# The Stock Screener Agent Logic
-# ==========================================
-class StockScreenerAgent:
+# ---------------------------------------------------------------------------
+# Indicators
+# ---------------------------------------------------------------------------
 
-  def __init__(
-    self,
-    rsi_low: float = 50.0,
-    rsi_high: float = 58.0,
-    cross_lookback: int = 5,
-  ):
-    self.rsi_low = rsi_low
-    self.rsi_high = rsi_high
-    self.cross_lookback = cross_lookback
+def compute_rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    """Wilder's RSI. ``ewm(com=period - 1)`` reproduces Wilder's smoothing."""
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
 
-  def _calculate_rsi(self, series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
     avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
     avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
 
-  def detect_bullish_divergence(self, df: pd.DataFrame, window: int = 3, max_distance: int = 40) -> dict:
+    rsi = 100.0 - (100.0 / (1.0 + avg_gain / avg_loss))
+    # A zero average loss makes the ratio inf (or NaN if gains are zero too).
+    # Both mean "no downside pressure in the window", which is RSI 100.
+    return rsi.where(avg_loss != 0, 100.0)
+
+
+def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of ``df`` with SMA50, SMA200 and RSI columns attached."""
+    out = df.copy()
+    close = out["Close"]
+    out["SMA50"] = close.rolling(SMA_FAST).mean()
+    out["SMA200"] = close.rolling(SMA_SLOW).mean()
+    out["RSI"] = compute_rsi(close)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Golden cross
+# ---------------------------------------------------------------------------
+
+def days_since_golden_cross(df: pd.DataFrame, max_lookback: int) -> Optional[int]:
     """
-    Identifies a Regular Bullish Divergence inside the historical dataset.
-    Specifically looks for two local price troughs where:
-    - The second trough is lower than the first trough.
-    - The corresponding RSI value for the second trough is higher than the first trough.
-    - The second trough (divergence resolution) occurred within the last 30 trading days.
+    Trading days since SMA50 last crossed *above* SMA200.
+
+    Returns ``None`` if no crossing is found inside ``max_lookback`` bars.
+    A return of 1 means the cross printed on the most recent bar.
     """
-    prices = df["Close"]
+    fast = df["SMA50"]
+    slow = df["SMA200"]
+
+    for age in range(1, max_lookback + 1):
+        current, previous = -age, -age - 1
+        if len(df) + previous < 0:
+            break
+
+        values = (fast.iloc[current], slow.iloc[current],
+                  fast.iloc[previous], slow.iloc[previous])
+        if any(pd.isna(v) for v in values):
+            break
+
+        crossed = values[0] > values[1] and values[2] <= values[3]
+        if crossed:
+            return age
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Bullish divergence
+# ---------------------------------------------------------------------------
+
+def _format_date(stamp) -> str:
+    try:
+        return stamp.strftime("%Y-%m-%d")
+    except AttributeError:
+        return str(stamp)
+
+
+def find_local_troughs(df: pd.DataFrame) -> List[dict]:
+    """Bars that are strictly lower than every neighbour within DIV_WINDOW."""
+    close = df["Close"]
     rsi = df["RSI"]
-    n = len(df)
-     
-    # Find local troughs (pivots) across the last 90 trading days to give room for T1
-    troughs = []
-    start_idx = max(window, n - 90)
-     
-    for i in range(start_idx, n - window):
-      val = prices.iloc[i]
-      # Must be strictly lower than surrounding prices in the window
-      is_trough = True
-      for offset in range(-window, window + 1):
-        if offset == 0:
-          continue
-        if prices.iloc[i + offset] <= val:
-          is_trough = False
-          break
-       
-      if is_trough:
+    total = len(df)
+
+    troughs: List[dict] = []
+    first = max(DIV_WINDOW, total - DIV_SEARCH_BARS)
+
+    for i in range(first, total - DIV_WINDOW):
+        price = close.iloc[i]
+        strength = rsi.iloc[i]
+        if pd.isna(price) or pd.isna(strength):
+            continue
+
+        neighbourhood = close.iloc[i - DIV_WINDOW:i + DIV_WINDOW + 1]
+        # Every other bar in the window must be strictly higher.
+        if int((neighbourhood > price).sum()) != len(neighbourhood) - 1:
+            continue
+
         troughs.append({
-          "idx": i,
-          "date": prices.index[i].strftime("%Y-%m-%d") if hasattr(prices.index[i], "strftime") else str(prices.index[i]),
-          "price": float(prices.iloc[i]),
-          "rsi": float(rsi.iloc[i])
+            "idx": i,
+            "date": _format_date(close.index[i]),
+            "price": float(price),
+            "rsi": float(strength),
         })
-     
-    # Evaluate combinations of troughs (T1, T2)
-    valid_divergences = []
-    for i in range(len(troughs)):
-      for j in range(i + 1, len(troughs)):
-        t1 = troughs[i]
-        t2 = troughs[j]
-         
-        # Filter by distance (can't be too close or too far apart)
-        distance = t2["idx"] - t1["idx"]
-        if distance < 5 or distance > max_distance:
-          continue
-         
-        # The second trough (T2) must fall within the last 30 trading days
-        if t2["idx"] < (n - 30):
-          continue
-         
-        # Check for Regular Bullish Divergence setup
-        # Lower low in Price, Higher low in RSI
-        if t2["price"] < t1["price"] and t2["rsi"] > t1["rsi"]:
-          valid_divergences.append((t1, t2))
-     
-    if valid_divergences:
-      # Sort to present the most recent divergence
-      valid_divergences.sort(key=lambda x: x[1]["idx"], reverse=True)
 
-      t1, t2 = valid_divergences[0]
+    return troughs
 
-      return {
-        "has_divergence": True,
-        "t1_date": t1["date"],
-        "t1_price": round(t1["price"], 2),
-        "t1_rsi": round(t1["rsi"], 2),
-        "t2_date": t2["date"],
-        "t2_price": round(t2["price"], 2),
-        "t2_rsi": round(t2["rsi"], 2),
-        "is_valid": True,
-        "message": "Valid Bullish Divergence Detected"
-      }
-       
+
+def detect_bullish_divergence(df: pd.DataFrame) -> dict:
+    """
+    Find a regular bullish divergence: a lower price trough paired with a
+    higher RSI trough, with the second trough resolving recently.
+    """
+    troughs = find_local_troughs(df)
+    total = len(df)
+    pairs: List[Tuple[dict, dict]] = []
+
+    for a in range(len(troughs)):
+        for b in range(a + 1, len(troughs)):
+            first, second = troughs[a], troughs[b]
+
+            separation = second["idx"] - first["idx"]
+            if not DIV_MIN_SEPARATION <= separation <= DIV_MAX_SEPARATION:
+                continue
+            if second["idx"] < total - DIV_RECENCY:
+                continue
+
+            lower_low = second["price"] < first["price"]
+            higher_rsi = second["rsi"] > first["rsi"]
+            if lower_low and higher_rsi:
+                pairs.append((first, second))
+
+    if not pairs:
+        return dict(NO_DIVERGENCE)
+
+    # Report the most recently resolved divergence.
+    pairs.sort(key=lambda pair: pair[1]["idx"], reverse=True)
+    first, second = pairs[0]
+
     return {
-      "has_divergence": False,
-      "t1_date": "N/A",
-      "t1_price": None,
-      "t1_rsi": None,
-      "t2_date": "N/A",
-      "t2_price": None,
-      "t2_rsi": None,
-      "is_valid": False,
-      "message": "No Bullish Divergence"
+        "has_divergence": True,
+        "div_t1_date": first["date"],
+        "div_t1_price": round(first["price"], 2),
+        "div_t1_rsi": round(first["rsi"], 2),
+        "div_t2_date": second["date"],
+        "div_t2_price": round(second["price"], 2),
+        "div_t2_rsi": round(second["rsi"], 2),
+        "div_message": "Valid bullish divergence detected",
     }
 
-  def analyze_ticker(self, ticker: str) -> dict:
-    try:
-      # 1. Pull current price from Google Finance first
-      gf_price, exchange = scrape_google_finance_price(ticker)
-       
-      # 2. Pull historical data
-      end_date = datetime.date.today()
-      start_date = end_date - datetime.timedelta(days=365)
 
-      stock = yf.Ticker(ticker)
-      df = stock.history(start=start_date, end=end_date, interval="1d")
+# ---------------------------------------------------------------------------
+# Screening
+# ---------------------------------------------------------------------------
 
-      if len(df) < 200:
+def screen_ticker(
+    ticker: str,
+    history: Optional[pd.DataFrame],
+    rsi_low: float,
+    rsi_high: float,
+    lookback: int,
+) -> dict:
+    """Run both setups against one ticker's history and return a flat record."""
+    available = 0 if history is None else len(history)
+    if available < MIN_TRADING_DAYS:
         return {
-          "ticker": ticker,
-          "status": "Skipped",
-          "reason": "Requires 200+ historical trading days",
+            "ticker": ticker,
+            "status": "Skipped",
+            "reason": "Only {} trading days available; {} needed for SMA200.".format(
+                available, MIN_TRADING_DAYS
+            ),
         }
 
-      # 3. Inject Google Finance price as the latest current close BEFORE calculations
-      if gf_price is not None:
-        df.iloc[-1, df.columns.get_loc('Close')] = gf_price
-        current_close = gf_price
-        price_source = f"Google Finance ({})"
-      else:
-        current_close = df["Close"].iloc[-1]
-        price_source = "Yahoo Finance (Google Scrape Rate-Limited)"
+    df = add_indicators(history)
 
-      # Technical indicator computation
-      df["SMA50"] = df["Close"].rolling(window=50).mean()
-      df["SMA200"] = df["Close"].rolling(window=200).mean()
-      df["RSI"] = self._calculate_rsi(df["Close"])
+    close_now = df["Close"].iloc[-1]
+    sma_fast = df["SMA50"].iloc[-1]
+    sma_slow = df["SMA200"].iloc[-1]
+    rsi_now = df["RSI"].iloc[-1]
 
-      current_sma50 = df["SMA50"].iloc[-1]
-      current_sma200 = df["SMA200"].iloc[-1]
-      current_rsi = df["RSI"].iloc[-1]
+    if any(pd.isna(v) for v in (close_now, sma_fast, sma_slow, rsi_now)):
+        return {
+            "ticker": ticker,
+            "status": "Skipped",
+            "reason": "Indicator values incomplete for the latest bar.",
+        }
 
-      # Bullish Divergence Analysis
-      div_results = self.detect_bullish_divergence(df)
+    is_bullish = bool(sma_fast > sma_slow)
+    cross_age = days_since_golden_cross(df, CROSS_SEARCH_DAYS) if is_bullish else None
+    crossed_recently = cross_age is not None and cross_age <= lookback
+    rsi_matches = rsi_low < rsi_now <= rsi_high
 
-      is_currently_bullish = current_sma50 > current_sma200
-      crossed_recently = False
-      cross_day_index = None
-      days_since_cross_actual = None
-
-      if is_currently_bullish:
-        # We search up to 30 trading days back to see when the cross actually occurred
-        for i in range(1, 31):
-          idx = -i
-          if len(df) + idx - 1 < 0:
-            break
-          if (
-            df["SMA50"].iloc[idx] > df["SMA200"].iloc[idx]
-            and df["SMA50"].iloc[idx - 1] <= df["SMA200"].iloc[idx - 1]
-          ):
-            days_since_cross_actual = i
-            if i <= self.cross_lookback:
-              crossed_recently = True
-              cross_day_index = i
-            break
-
-      rsi_matches = self.rsi_low < current_rsi <= self.rsi_high
-      meets_criteria = crossed_recently and rsi_matches
-
-      return {
+    record = {
         "ticker": ticker,
-        "status": "MATCH" if meets_criteria else "NO MATCH",
-        "current_price": round(current_close, 2),
-        "SMA50": round(current_sma50, 2),
-        "SMA200": round(current_sma200, 2),
-        "RSI": round(current_rsi, 2),
-        "is_currently_bullish": is_currently_bullish,
+        "status": "MATCH" if (crossed_recently and rsi_matches) else "NO MATCH",
+        "current_price": round(float(close_now), 2),
+        "SMA50": round(float(sma_fast), 2),
+        "SMA200": round(float(sma_slow), 2),
+        "RSI": round(float(rsi_now), 2),
+        "is_currently_bullish": is_bullish,
         "golden_cross_recent": crossed_recently,
-        "days_since_cross": cross_day_index,
-        "days_since_cross_actual": days_since_cross_actual,
-        "price_source": price_source,
-        # Bullish Divergence payload
-        "has_divergence": div_results["has_divergence"],
-        "div_t1_date": div_results["t1_date"],
-        "div_t1_price": div_results["t1_price"],
-        "div_t1_rsi": div_results["t1_rsi"],
-        "div_t2_date": div_results["t2_date"],
-        "div_t2_price": div_results["t2_price"],
-        "div_t2_rsi": div_results["t2_rsi"],
-        "div_valid": div_results["is_valid"],
-        "div_message": div_results["message"]
-      }
-    except Exception as e:
-      return {
-        "ticker": ticker,
-        "status": "Error",
-        "reason": f"Failed: {str(e)}",
-      }
+        "days_since_cross": cross_age if crossed_recently else None,
+        "days_since_cross_actual": cross_age,
+        "as_of": _format_date(df.index[-1]),
+    }
+    record.update(detect_bullish_divergence(df))
+    return record
 
 
-# ==========================================
-# Automated Parameter Recommendation Engine
-# ==========================================
-def generate_recommendations(skipped_or_no_match: list, rsi_min: float, rsi_max: float, lookback: int) -> list:
-  """Analyzes non-matching stocks and suggests settings changes to find candidates."""
-  recommendations = []
-  lookback_near_matches = []
-  rsi_near_matches = []
-  bearish_count = 0
-  total_processed = 0
+# ---------------------------------------------------------------------------
+# Data access
+# ---------------------------------------------------------------------------
 
-  for item in skipped_or_no_match:
-    if item.get("status") in ["Skipped", "Error"]:
-      continue
-    total_processed += 1
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_history(tickers: Tuple[str, ...], years: int) -> Dict[str, pd.DataFrame]:
+    """
+    Download daily history for every ticker in one batched request.
 
-    # Track if it's completely bearish (no golden cross active)
-    if not item.get("is_currently_bullish", False):
-      bearish_count += 1
-      continue
+    One batched call is far friendlier to Yahoo's rate limits than a request
+    per ticker, which matters on shared cloud IPs. Tickers that Yahoo can't
+    resolve are simply absent from the returned mapping.
+    """
+    if not tickers:
+        return {}
 
-    actual_cross = item.get("days_since_cross_actual")
-    current_rsi = item.get("RSI")
-    ticker = item.get("ticker")
+    end = dt.date.today() + dt.timedelta(days=1)  # end is exclusive
+    start = end - dt.timedelta(days=365 * years + 10)
 
-    # Case 1: Has a Golden Cross, but it happened outside our lookback limit
-    if actual_cross is not None and actual_cross > lookback:
-      lookback_near_matches.append({
-        "ticker": ticker,
-        "actual_cross": actual_cross,
-        "rsi": current_rsi
-      })
-
-    # Case 2: Crossed within our lookback limit, but RSI was slightly out of bounds
-    elif actual_cross is not None and actual_cross <= lookback:
-      if current_rsi < rsi_min or current_rsi > rsi_max:
-        rsi_near_matches.append({
-          "ticker": ticker,
-          "actual_cross": actual_cross,
-          "rsi": current_rsi
-        })
-
-  # Scenario A: All stocks are completely bearish
-  if bearish_count == total_processed and total_processed > 0:
-    recommendations.append(
-      "⚠️ **Bearish Market Trend:** All scanned stocks are in a bearish phase (SMA50 < SMA200). "
-      "No adjusting of settings can find a Golden Cross here. Consider adding other sectors, index ETFs, or waiting for a cycle shift."
+    raw = yf.download(
+        tickers=list(tickers),
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+        timeout=30,
     )
+
+    if raw is None or raw.empty:
+        return {}
+
+    histories: Dict[str, pd.DataFrame] = {}
+    multi = isinstance(raw.columns, pd.MultiIndex)
+
+    for ticker in tickers:
+        try:
+            if multi:
+                if ticker not in raw.columns.get_level_values(0):
+                    continue
+                frame = raw[ticker].copy()
+            else:
+                frame = raw.copy()
+        except (KeyError, IndexError):
+            continue
+
+        if "Close" not in frame.columns:
+            continue
+
+        frame = frame.dropna(subset=["Close"])
+        if not frame.empty:
+            histories[ticker] = frame
+
+    return histories
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def tickers_from_google_sheet(url: str) -> Tuple[List[str], Optional[str]]:
+    """
+    Pull tickers out of a published Google Sheet.
+
+    Returns ``(tickers, error)``. The error is returned rather than rendered
+    here because this function is cached - a cached call would skip any
+    Streamlit side effect on subsequent runs.
+    """
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    if not match:
+        return [], "That doesn't look like a Google Sheets link."
+
+    csv_url = "https://docs.google.com/spreadsheets/d/{}/export?format=csv".format(
+        match.group(1)
+    )
+    gid = re.search(r"[#&?]gid=([0-9]+)", url)
+    if gid:
+        csv_url += "&gid={}".format(gid.group(1))
+
+    try:
+        response = requests.get(csv_url, timeout=15)
+        response.raise_for_status()
+        sheet = pd.read_csv(io.StringIO(response.text))
+    except Exception as exc:  # network, HTTP, or parse failure
+        return [], (
+            "Couldn't read that sheet ({}). Make sure it is shared as "
+            "'Anyone with the link can view'.".format(exc)
+        )
+
+    for column in sheet.columns:
+        values = sheet[column].astype(str).str.strip().str.upper()
+        valid = values[values.str.fullmatch(r"[A-Z]{1,5}([.\-][A-Z])?", na=False)]
+        if not valid.empty:
+            return list(dict.fromkeys(valid)), None
+
+    return [], "No column in that sheet looked like a list of ticker symbols."
+
+
+def parse_tickers(raw: str) -> List[str]:
+    """Split user input into a deduplicated, upper-cased ticker list."""
+    candidates = re.split(r"[,\s]+", raw.upper())
+    cleaned = [c.strip() for c in candidates if c.strip()]
+    valid = [c for c in cleaned if re.fullmatch(r"[A-Z0-9]{1,6}([.\-][A-Z]{1,2})?", c)]
+    return list(dict.fromkeys(valid))
+
+
+# ---------------------------------------------------------------------------
+# Recommendation engine
+# ---------------------------------------------------------------------------
+
+def generate_recommendations(
+    non_matches: Sequence[dict],
+    rsi_min: float,
+    rsi_max: float,
+    lookback: int,
+) -> List[str]:
+    """Suggest setting changes that would surface near-miss candidates."""
+    lookback_near: List[dict] = []
+    rsi_near: List[dict] = []
+    bearish = 0
+    considered = 0
+
+    for item in non_matches:
+        if item.get("status") in ("Skipped", "Error"):
+            continue
+        considered += 1
+
+        if not item.get("is_currently_bullish", False):
+            bearish += 1
+            continue
+
+        cross_age = item.get("days_since_cross_actual")
+        if cross_age is None:
+            continue
+
+        entry = {
+            "ticker": item.get("ticker"),
+            "cross_age": cross_age,
+            "rsi": item.get("RSI"),
+        }
+
+        if cross_age > lookback:
+            # Golden cross is real, just older than the current window.
+            lookback_near.append(entry)
+        elif entry["rsi"] is not None and not (rsi_min < entry["rsi"] <= rsi_max):
+            # Crossed in time, but RSI sat outside the band.
+            rsi_near.append(entry)
+
+    recommendations: List[str] = []
+
+    if considered > 0 and bearish == considered:
+        return [
+            "⚠️ **Bearish across the board:** every scanned stock has SMA50 below "
+            "SMA200, so no setting will surface a Golden Cross here. Consider adding "
+            "other sectors or index ETFs, or waiting for the cycle to turn."
+        ]
+
+    if lookback_near:
+        lookback_near.sort(key=lambda e: e["cross_age"])
+        best = lookback_near[:3]
+        needed = max(e["cross_age"] for e in best)
+        names = ", ".join(
+            "**{}** (crossed {} days ago, RSI {})".format(e["ticker"], e["cross_age"], e["rsi"])
+            for e in best
+        )
+        recommendations.append(
+            "📅 **Widen the cross lookback:** some active Golden Crosses are just older "
+            "than your {}-day window. Raising **Lookback Days to {}** would capture: "
+            "{}.".format(lookback, needed, names)
+        )
+
+    if rsi_near:
+        suggested_min, suggested_max = rsi_min, rsi_max
+        for entry in rsi_near:
+            suggested_min = min(suggested_min, entry["rsi"] - 1)
+            suggested_max = max(suggested_max, entry["rsi"] + 1)
+        names = ", ".join(
+            "**{}** (crossed {} days ago, RSI {})".format(e["ticker"], e["cross_age"], e["rsi"])
+            for e in rsi_near[:3]
+        )
+        recommendations.append(
+            "⚖️ **Widen the RSI band:** these completed a Golden Cross but their RSI fell "
+            "outside {} - {}. Adjusting **RSI Bounds to {} - {}** would capture: {}.".format(
+                rsi_min, rsi_max, round(suggested_min, 1), round(suggested_max, 1), names
+            )
+        )
+
+    if not recommendations:
+        recommendations.append(
+            "💡 **Widen the search:** no near-misses turned up in a 30-day window. Try a "
+            "broader list of symbols, or sync a larger public Google Sheets watchlist."
+        )
+
     return recommendations
 
-  # Scenario B: Suggest Lookback Adjustment
-  if lookback_near_matches:
-    lookback_near_matches.sort(key=lambda x: x["actual_cross"])
-    best_cands = lookback_near_matches[:3]
-    cand_str = ", ".join([f"**{c['ticker']}** (crossed {c['actual_cross']} days ago, RSI: {c['rsi']})" for c in best_cands])
-    max_needed_lookback = max([c['actual_cross'] for c in best_cands])
-    recommendations.append(
-      f"📅 **Adjust Golden Cross Lookback:** We detected active Golden Cross patterns slightly older than your {}-day setting. "
-      f"If you increase your **Lookback Days to {}**, you would capture: {}."
-    )
 
-  # Scenario C: Suggest RSI Bounds Adjustment
-  if rsi_near_matches:
-    cand_details = []
-    suggest_min, suggest_max = rsi_min, rsi_max
-    for c in rsi_near_matches:
-      suggest_min = min(suggest_min, c['rsi'] - 1)
-      suggest_max = max(suggest_max, c['rsi'] + 1)
-      cand_details.append(f"**{c['ticker']}** (crossed {c['actual_cross']} days ago, RSI: {c['rsi']})")
-     
-    cand_str = ", ".join(cand_details[:3])
-    recommendations.append(
-      f"⚖️ **Adjust RSI Bounds:** Several stocks completed their Golden Cross, but their RSI fell outside your {} - {} range. "
-      f"If you adjust your **RSI Bounds to {round(suggest_min, 1)} - {round(suggest_max, 1)}**, you would capture: {}."
-    )
+# ---------------------------------------------------------------------------
+# Interface
+# ---------------------------------------------------------------------------
 
-  if not recommendations:
-    recommendations.append(
-      "💡 **Expand Your Search:** No near-matches were found within a 30-day window. "
-      "Try adding a wider variety of symbols or linking a larger public Google Sheets watchlist."
-    )
-
-  return recommendations
-
-
-# ==========================================
-# Streamlit Web Interface Design
-# ==========================================
 st.set_page_config(
-  page_title="Golden Cross & RSI Screener Agent",
-  page_icon="📈",
-  layout="wide",
+    page_title="Golden Cross & RSI Screener",
+    page_icon="📈",
+    layout="wide",
 )
 
-st.title("📈 Multi-Engine Technical Screener Agent")
+st.title("📈 Technical Screener Agent")
 st.markdown(
-  """
-This agent scans stocks using **real-time prices pulled from Google Finance** mixed with Yahoo Finance historical calculations. 
-It supports both **Golden Cross setups** and checks for **Regular Bullish Divergence setups** in parallel!
-"""
+    "Scans a watchlist for **Golden Cross + RSI** setups and **Regular Bullish "
+    "Divergences** in parallel. Prices are split- and dividend-adjusted daily "
+    "closes from Yahoo Finance."
 )
 
-# Sidebar Configuration
-st.sidebar.header("⚙️ Rule Rules")
-rsi_min = st.sidebar.slider(
-  "Minimum RSI", min_value=30.0, max_value=70.0, value=50.0, step=1.0
-)
-rsi_max = st.sidebar.slider(
-  "Maximum RSI (Just Above 50)",
-  min_value=51.0,
-  max_value=80.0,
-  value=58.0,
-  step=1.0,
-)
+st.sidebar.header("⚙️ Screening Rules")
+rsi_min = st.sidebar.slider("Minimum RSI", 30.0, 70.0, 50.0, step=1.0)
+rsi_max = st.sidebar.slider("Maximum RSI", 31.0, 80.0, 58.0, step=1.0)
 lookback = st.sidebar.number_input(
-  "Golden Cross Lookback (Days)", min_value=1, max_value=30, value=5, step=1
+    "Golden Cross lookback (trading days)", min_value=1, max_value=CROSS_SEARCH_DAYS,
+    value=5, step=1,
 )
+
+if rsi_min >= rsi_max:
+    st.sidebar.error("Minimum RSI must be below maximum RSI - nothing can match.")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(
-  "💡 *Parallel processing scans up to 10 stocks simultaneously, significantly speeding up watchlist lookups.*"
+if st.sidebar.button("🔄 Clear cached prices"):
+    fetch_history.clear()
+    tickers_from_google_sheet.clear()
+    st.sidebar.success("Cache cleared - the next scan refetches.")
+st.sidebar.caption(
+    "Prices are cached for {} minutes and fetched in a single batched request.".format(
+        CACHE_TTL_SECONDS // 60
+    )
 )
 
-# Set Default starting tickers
-default_tickers = "AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, AMD, INTC, JPM, MU, QCOM"
-
+DEFAULT_TICKERS = "AAPL, MSFT, GOOGL, AMZN, NVDA, TSLA, META, AMD, INTC, JPM, MU, QCOM"
 if "ticker_list" not in st.session_state:
-  st.session_state["ticker_list"] = default_tickers
+    st.session_state["ticker_list"] = DEFAULT_TICKERS
 
-# Main Page Layout (Two Columns)
-col1, col2 = st.columns([2, 1])
+left, right = st.columns([2, 1])
 
-with col1:
-  ticker_input = st.text_area(
-    "Enter Stock Ticker Symbols (comma-separated):",
-    value=st.session_state["ticker_list"],
-    height=100,
-  )
-
-with col2:
-  st.write("### Sync Public Google Sheet:")
-  google_sheet_url = st.text_input(
-    "Paste a public Google Sheets link to sync tickers:",
-    placeholder="https://docs.google.com/spreadsheets/...",
-  )
-  if google_sheet_url:
-    sheet_tickers = extract_tickers_from_google_sheet(google_sheet_url)
-    if sheet_tickers:
-      ticker_str = ", ".join(sheet_tickers)
-      if st.session_state["ticker_list"] != ticker_str:
-        st.session_state["ticker_list"] = ticker_str
-        st.rerun()
-
-# Start Analysis Button
-if st.button("🚀 Run Screener Agent", type="primary"):
-  # Parse inputs
-  tickers = [t.strip().upper() for t in ticker_input.split(",") if t.strip()]
-
-  if not tickers:
-    st.warning("Please enter at least one ticker.")
-  else:
-    agent = StockScreenerAgent(
-      rsi_low=rsi_min, rsi_high=rsi_max, cross_lookback=lookback
+with left:
+    ticker_input = st.text_area(
+        "Ticker symbols (comma or space separated):",
+        value=st.session_state["ticker_list"],
+        height=100,
     )
 
-    all_results = []
+with right:
+    st.markdown("**Sync a public Google Sheet**")
+    sheet_url = st.text_input(
+        "Paste a shared Google Sheets link:",
+        placeholder="https://docs.google.com/spreadsheets/...",
+    )
+    if sheet_url:
+        sheet_tickers, sheet_error = tickers_from_google_sheet(sheet_url)
+        if sheet_error:
+            st.error(sheet_error)
+        elif sheet_tickers:
+            joined = ", ".join(sheet_tickers)
+            if st.session_state["ticker_list"] != joined:
+                st.session_state["ticker_list"] = joined
+                st.rerun()
+            st.success("Synced {} tickers.".format(len(sheet_tickers)))
 
-    # Streamlit Progress trackers
-    progress_bar = st.progress(0)
-    status_text = st.empty()
+if st.button("🚀 Run screener", type="primary"):
+    tickers = parse_tickers(ticker_input)
 
-    total_tickers = len(tickers)
-    status_text.text(f"Starting parallel scan for {} stocks...")
+    if not tickers:
+        st.warning("Enter at least one ticker symbol.")
+        st.stop()
 
-    # Multi-threading executor for concurrent scraping and analytics
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-      # Map ticker requests to the threadpool
-      future_to_ticker = {
-        executor.submit(agent.analyze_ticker, ticker): ticker 
-        for ticker in tickers
-      }
-       
-      # As each ticker analysis completes, update the UI dynamically
-      for index, future in enumerate(concurrent.futures.as_completed(future_to_ticker)):
-        ticker = future_to_ticker[future]
+    if len(tickers) > MAX_TICKERS:
+        st.warning(
+            "Scanning the first {} of {} tickers.".format(MAX_TICKERS, len(tickers))
+        )
+        tickers = tickers[:MAX_TICKERS]
+
+    with st.spinner("Fetching {} tickers from Yahoo Finance...".format(len(tickers))):
         try:
-          result = future.result()
-          all_results.append(result)
-        except Exception as e:
-          all_results.append({
-            "ticker": ticker,
-            "status": "Error",
-            "reason": f"Execution failed: {str(e)}"
-          })
-         
-        # Update progress bar
-        progress_bar.progress((index + 1) / total_tickers)
-        status_text.text(f"Scanned {}... ({index + 1}/{})")
+            histories = fetch_history(tuple(tickers), HISTORY_YEARS)
+        except Exception as exc:
+            st.error("Price download failed: {}".format(exc))
+            st.stop()
 
-    status_text.text("Scan Completed!")
-    progress_bar.empty()
+    if not histories:
+        st.error(
+            "No price data came back. Yahoo may be rate-limiting this deployment, "
+            "or none of those symbols resolved. Try again shortly."
+        )
+        st.stop()
 
-    # Display Results using Dynamic Tabs
-    st.markdown("## 📊 Scan Results")
-     
-    # Categorize results
-    matches = [r for r in all_results if r.get("status") == "MATCH"]
-    skipped_or_no_match = [r for r in all_results if r.get("status") != "MATCH"]
-    divergence_matches = [r for r in all_results if r.get("has_divergence") == True]
+    progress = st.progress(0.0)
+    status = st.empty()
+    results: List[dict] = []
 
-    tab1, tab2, tab3 = st.tabs([
-      "🎯 Golden Cross & RSI Setups", 
-      "🐂 Bullish Divergences (Last 30 Days)", 
-      "🔍 All Scanned Stocks"
+    for position, ticker in enumerate(tickers, start=1):
+        status.text("Analyzing {} ({}/{})".format(ticker, position, len(tickers)))
+        try:
+            results.append(
+                screen_ticker(ticker, histories.get(ticker), rsi_min, rsi_max, lookback)
+            )
+        except Exception as exc:
+            results.append({
+                "ticker": ticker,
+                "status": "Error",
+                "reason": "Analysis failed: {}".format(exc),
+            })
+        progress.progress(position / len(tickers))
+
+    progress.empty()
+    status.empty()
+
+    matches = [r for r in results if r.get("status") == "MATCH"]
+    non_matches = [r for r in results if r.get("status") != "MATCH"]
+    divergences = [r for r in results if r.get("has_divergence")]
+
+    st.markdown("## 📊 Results")
+    tab_cross, tab_div, tab_all = st.tabs([
+        "🎯 Golden Cross & RSI",
+        "🐂 Bullish Divergences",
+        "🔍 All Scanned",
     ])
 
-    # ==========================================
-    # TAB 1: GOLDEN CROSS & RSI
-    # ==========================================
-    with tab1:
-      if matches:
-        st.success(f"🎉 Found **{len(matches)}** stock(s) meeting Golden Cross criteria!")
-        df_matches = pd.DataFrame(matches)
-        display_cols = [
-          "ticker",
-          "current_price",
-          "price_source",
-          "SMA50",
-          "SMA200",
-          "RSI",
-          "days_since_cross",
-        ]
-        st.dataframe(df_matches[display_cols], use_container_width=True)
-      else:
-        st.error("❌ No stocks currently meet the strict Golden Cross & RSI parameters.")
-         
-        # Render Smart Fallback recommendations
-        st.markdown("### 💡 Recommended Adjustments")
-        recs = generate_recommendations(skipped_or_no_match, rsi_min, rsi_max, lookback)
-        for rec in recs:
-          st.info(rec)
+    with tab_cross:
+        if matches:
+            st.success("Found {} stock(s) meeting the Golden Cross criteria.".format(len(matches)))
+            st.dataframe(
+                pd.DataFrame(matches)[[
+                    "ticker", "current_price", "SMA50", "SMA200",
+                    "RSI", "days_since_cross", "as_of",
+                ]],
+                hide_index=True,
+            )
+        else:
+            st.error("No stocks meet the current Golden Cross and RSI parameters.")
+            st.markdown("### 💡 Suggested adjustments")
+            for note in generate_recommendations(non_matches, rsi_min, rsi_max, lookback):
+                st.info(note)
 
-    # ==========================================
-    # TAB 2: BULLISH DIVERGENCES
-    # ==========================================
-    with tab2:
-      st.markdown(
-        """
-        **Regular Bullish Divergence** signals potential bullish reversals. 
-        Below are scanned tickers showing a lower price trough but a higher RSI trough within the last 30 trading days.
-        """
-      )
-      if divergence_matches:
-        st.success(f"🔥 Detected **{len(divergence_matches)}** stock(s) with Regular Bullish Divergence!")
-        df_div = pd.DataFrame(divergence_matches)
-        div_cols = [
-          "ticker",
-          "current_price",
-          "div_t1_date",
-          "div_t1_price",
-          "div_t1_rsi",
-          "div_t2_date",
-          "div_t2_price",
-          "div_t2_rsi",
-          "div_valid"
-        ]
-        # Format header columns cleanly
-        df_div_clean = df_div[div_cols].rename(columns={
-          "div_t1_date": "Trough 1 Date",
-          "div_t1_price": "Trough 1 Price",
-          "div_t1_rsi": "Trough 1 RSI",
-          "div_t2_date": "Trough 2 Date",
-          "div_t2_price": "Trough 2 Price",
-          "div_t2_rsi": "Trough 2 RSI",
-          "div_valid": "Signal Validated"
-        })
-        st.dataframe(df_div_clean, use_container_width=True)
-      else:
-        st.info("ℹ️ No stocks in the input list exhibit a Regular Bullish Divergence within the last 30 trading days.")
+    with tab_div:
+        st.markdown(
+            "A **regular bullish divergence** is a lower price trough paired with a "
+            "higher RSI trough - a possible reversal signal. Only divergences "
+            "resolving in the last {} trading days are shown.".format(DIV_RECENCY)
+        )
+        if divergences:
+            st.success("Detected {} stock(s) with a bullish divergence.".format(len(divergences)))
+            table = pd.DataFrame(divergences)[[
+                "ticker", "current_price",
+                "div_t1_date", "div_t1_price", "div_t1_rsi",
+                "div_t2_date", "div_t2_price", "div_t2_rsi",
+            ]].rename(columns={
+                "div_t1_date": "Trough 1 date",
+                "div_t1_price": "Trough 1 price",
+                "div_t1_rsi": "Trough 1 RSI",
+                "div_t2_date": "Trough 2 date",
+                "div_t2_price": "Trough 2 price",
+                "div_t2_rsi": "Trough 2 RSI",
+            })
+            st.dataframe(table, hide_index=True)
+        else:
+            st.info("No bullish divergences in the last {} trading days.".format(DIV_RECENCY))
 
-    # ==========================================
-    # TAB 3: ALL SCANNED STOCKS (DEBUG)
-    # ==========================================
-    with tab3:
-      st.markdown("This tab displays technical data captured across all successfully queried tickers.")
-      if all_results:
-        df_all = pd.DataFrame(all_results)
-        st.dataframe(df_all, use_container_width=True)
-      else:
-        st.write("No tickers evaluated.")
+    with tab_all:
+        st.markdown("Everything returned by the scan, including skips and errors.")
+        all_results = pd.DataFrame(results)
+        st.dataframe(all_results, hide_index=True)
+        st.download_button(
+            "⬇️ Download results as CSV",
+            data=all_results.to_csv(index=False).encode("utf-8"),
+            file_name="screener-results-{}.csv".format(dt.date.today().isoformat()),
+            mime="text/csv",
+        )

@@ -1,6 +1,24 @@
-streamlit>=1.30.0
-pandas>=2.0.0
-requests>=2.31.0
-yfinance>=0.2.36
-beautifulsoup4>=4.1[<vertex-ai-rich-citation-chip>7</vertex-ai-rich-citation-chip>]2.0
-lxml>=4.9.0
+# Requires Python 3.10 or newer.
+#   yfinance 1.x -> curl_cffi >= 0.15 -> Python >= 3.10
+#   streamlit 1.59            -> Python >= 3.10
+# Set the Python version in the Streamlit Cloud app's Advanced settings.
+#
+# Only direct imports are listed. yfinance already pulls in numpy,
+# beautifulsoup4, curl_cffi, peewee, protobuf and websockets itself.
+#
+# Upper bounds are deliberate. This app previously pinned "yfinance>=0.2.36"
+# with no ceiling, which today resolves to 1.x - a major release with
+# different defaults (auto_adjust now defaults to True). Ceilings stop a
+# future major from breaking the deployment silently; the floors still allow
+# patch and minor updates, which matter for yfinance in particular because it
+# ships fixes whenever Yahoo changes its endpoints.
+#
+# pandas is held below 3.0 because that is the line the analysis logic was
+# tested against. The code avoids chained assignment and in-place mutation, so
+# it should be copy-on-write safe, but that is untested - move to <4 only
+# after a deploy confirms it.
+
+streamlit>=1.40,<2
+pandas>=2.2,<3
+requests>=2.31,<3
+yfinance>=1.5,<2
