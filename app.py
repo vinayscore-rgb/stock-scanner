@@ -59,7 +59,7 @@ def extract_tickers_from_google_sheet(url: str) -> list:
       if match:
         sheet_id = match.group(1)
         # Appends a direct CSV export endpoint to read the sheet via pandas
-        csv_url = f"https://docs.google.com/spreadsheets/d/{}/export?format=csv"
+        csv_url = "https://docs.google.com/spreadsheets/d/{}/export?format=csv"
         sheet_df = pd.read_csv(csv_url)
          
         # Look for columns that contain 1 to 5-letter uppercase strings
