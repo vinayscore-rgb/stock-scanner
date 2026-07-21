@@ -1,5 +1,6 @@
-streamlit
-yfinance
-pandas
-beautifulsoup4
-requests
+streamlit>=1.30.0
+pandas>=2.0.0
+requests>=2.31.0
+yfinance>=0.2.36
+beautifulsoup4>=4.1[<vertex-ai-rich-citation-chip>7</vertex-ai-rich-citation-chip>]2.0
+lxml>=4.9.0
