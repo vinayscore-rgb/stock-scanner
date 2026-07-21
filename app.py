@@ -35,7 +35,7 @@ def scrape_google_finance_price(ticker: str) -> tuple:
        
   # Try raw ticker as final fallback
   try:
-    url = f"https://www.google.com/finance/quote/{}"
+    url = "https://www.google.com/finance/quote/{}"
     res = requests.get(url, headers=headers, timeout=5)
     if res.status_code == 200:
       soup = BeautifulSoup(res.text, "html.parser")
