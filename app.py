@@ -48,7 +48,6 @@ def scrape_google_finance_price(ticker: str) -> tuple:
      
   return None, None
 
-
 # ==========================================
 # Public Google Sheets Parser Helper
 # ==========================================
